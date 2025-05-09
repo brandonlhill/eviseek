@@ -87,3 +87,10 @@ end goal: perhaps have an LLM generate a TIP (threat intel package)... save the 
 
 
 
+[ResourceTemplate
+
+(uriTemplate='so_files+zeek://{filename}', name='get_zeek_file', description='Retrieve a file from the Zeek directory.', mimeType='application/octet-stream', annotations=None), ResourceTemplate
+  
+(uriTemplate='so_files+suricata://{filename}', name='get_suricata_pcap', description='Retrieve a PCAP from the Suricata directory.', mimeType='application/octet-stream', annotations=None), ResourceTemplate
+  
+(uriTemplate='so_files+strelka://{filename}', name='get_strelka_file', description='Retrieve a file from the Strelka directory.', mimeType='application/octet-stream', annotations=None)]

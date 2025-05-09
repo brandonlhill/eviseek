@@ -1,3 +1,4 @@
+
 import assemblyline_client
 import asyncio
 import json
@@ -6,6 +7,8 @@ import os
 import threading
 import time
 import queue
+
+from openai import OpenAI
 from datetime import datetime
 from tinydb import TinyDB, Query
 from tinydb.storages import JSONStorage
@@ -17,7 +20,7 @@ from config import load_config
 from logger import setup_logging
 
 # Setup logging and config
-log = setup_logging(level=logging.INFO)
+log = setup_logging(level=logging.DEBUG)
 config = load_config()
 
 # SSH/SFTP configuration
@@ -29,6 +32,7 @@ REMOTE_HOST = config["ssh"]["remote_host"]
 REMOTE_PORT = config["ssh"]["remote_port"]
 
 # Local configuration
+openai_llm = client = OpenAI(api_key="")
 ALERT_DB_PATH = os.path.expanduser(config["local"].get("alert_db_path", "~/.eviseek/alert_db.json"))
 CHECK_INTERVAL = 10
 BATCH_SIZE = config["local"].get("batch_size", 100)
@@ -107,20 +111,20 @@ class AssemblylineConnector:
         self.password = password
         self.queue_name = queue
         self.client = None
-        self.log = logging.getLogger("__main__")
         self._connect(verify=verify)
 
     def _connect(self, verify=False):
         try:
             self.client = assemblyline_client.get_client(self.host, auth=(self.user, self.password), verify=verify)
-            self.log.info("Connected to Assemblyline at %s", self.host)
+            log.info("Connected to Assemblyline at %s", self.host)
         except Exception as e:
-            self.log.error("Connection failed: %s", e)
+            log.error("Connection failed: %s", e)
             raise
 
     def submit_full_analysis(self, filepath, description="Comprehensive Analysis", classification="TLP:C", metadata=None):
+        self
         if not os.path.isfile(filepath):
-            self.log.error("File not found: %s", filepath)
+            log.error("File not found: %s", filepath)
             return None
 
         filename = os.path.basename(filepath)
@@ -135,8 +139,8 @@ class AssemblylineConnector:
             "classification": classification,
             "description": description,
             "name": filename,
-            "deep_scan": True,
-            "ignore_cache": True,
+            "deep_scan": False,
+            "ignore_cache": False,
             "ignore_filtering": True,
             "ignore_recursion_prevention": True,
             "ignore_size": True,
@@ -164,31 +168,31 @@ class AssemblylineConnector:
                 metadata=metadata
             )
             ingest_id = result.get("ingest_id")
-            self.log.info("Submitted %s, Ingest ID: %s", filename, ingest_id)
+            log.info("Submitted %s, Ingest ID: %s", filename, ingest_id)
             return ingest_id
         except Exception as e:
-            self.log.error("Submission failed: %s", e)
+            log.error("Submission failed: %s", e)
             return None
 
     def wait_for_result(self, ingest_id, poll_interval=3):
-        self.log.info("Waiting for result for ingest ID: %s", ingest_id)
+        log.info("Waiting for result for ingest ID: %s", ingest_id)
         while True:
             try:
                 message = self.client.ingest.get_message(self.queue_name)
                 if message and message.get("ingest_id") == ingest_id:
-                    self.log.info("Received result for ingest ID: %s", ingest_id)
+                    log.info("Received result for ingest ID: %s", ingest_id)
                     return message
             except Exception as e:
-                self.log.warning("Polling error: %s", e)
+                log.warning("Polling error: %s", e)
             time.sleep(poll_interval)
 
     def get_full_submission(self, sid):
         try:
             result = self.client.submission(sid)
-            self.log.info("Fetched submission SID: %s", sid)
+            log.info("Fetched submission SID: %s", sid)
             return result
         except Exception as e:
-            self.log.error("Failed to fetch submission %s: %s", sid, e)
+            log.error("Failed to fetch submission %s: %s", sid, e)
             return None
 
     def submit_and_collect(self, filepath):
@@ -204,7 +208,7 @@ class AssemblylineConnector:
         if sid:
             return self.get_full_submission(sid)
         else:
-            self.log.warning("No SID in message.")
+            log.warning("No SID in message.")
             return message
 
 class AlertIngestorThread(threading.Thread):
@@ -212,7 +216,7 @@ class AlertIngestorThread(threading.Thread):
         super().__init__()
         self.stop_event = stop_event
         self.tracker = shared_tracker
-        # TODO: need to add self.log! 
+        # TODO: need to add log! 
 
     def run(self):
         asyncio.run(self.ingest_loop())
@@ -262,6 +266,7 @@ class AlertIngestorThread(threading.Thread):
             await mcp.stop_client()
 
     def stop(self):
+        log.debug("AlertIngestorThread stop was triggered.")
         self.stop_event.set()
 
 class StrelkaProcessorThread(threading.Thread):
@@ -269,7 +274,6 @@ class StrelkaProcessorThread(threading.Thread):
         super().__init__()
         self.stop_event = stop_event
         self.tracker = shared_tracker
-        self.log = logging.getLogger("__name__")
 
         # Create an AssemblylineConnector instance
         self.al = AssemblylineConnector(
@@ -288,15 +292,64 @@ class StrelkaProcessorThread(threading.Thread):
             except queue.Empty:
                 continue
             except Exception as e:
-                self.log.error(f"Error processing alert: {e}")
+                log.error(f"Error processing alert: {e}")
 
-    def stop(self):
+    def stop(self): # There is possible a deadlock that can occur while shutting down
+        log.debug("StrelkaProcessorThread stop was triggered.")
         self.stop_event.set()
+        self.join(timeout=5)  # optionally wait up to 5s
+        if self.is_alive():
+            log.warning("AlertIngestorThread did not shut down cleanly.")
+        else:
+            log.debug("AlertIngestorThread has shut down.")
+
+    def summarize_alert_with_llm(self, hit: dict, reports: list, artifacts: list) -> str:
+        """Summarize the alert using OpenAI ChatGPT given the alert components."""
+        try:
+            alert = hit.get("_source", {})
+            report = reports[0].get("assemblyline_report", {}) if reports else {}
+
+            filename = alert.get("request", {}).get("attributes", {}).get("filename", "unknown")
+            sha256 = alert.get("hash", {}).get("sha256", "unknown")
+            compile_time = alert.get("scan", {}).get("pe", {}).get("compile_time", "unknown")
+            imported_libs = alert.get("scan", {}).get("pe", {}).get("symbols", {}).get("libraries", [])
+            entropy = alert.get("scan", {}).get("entropy", {}).get("entropy", None)
+            max_score = report.get("max_score", "N/A")
+            error_count = report.get("error_count", 0)
+            submitted_by = report.get("metadata", {}).get("submitted_by", "unknown")
+            submission_time = report.get("metadata", {}).get("ts", "unknown")
+            services = len(report.get("results", []))
+
+            prompt = f"""You are a cybersecurity analyst.
+                        Summarize the following file alert and malware scan report in 3–5 sentences.
+                        Use professional, technical language and include any risk indicators or relevant file behaviors.
+
+                        File: {filename}
+                        SHA256: {sha256}
+                        Compile Time: {compile_time}
+                        Entropy: {entropy:.2f} ({'high' if entropy and entropy > 7 else 'moderate' if entropy and entropy > 5 else 'low'})
+                        Imported Libraries: {', '.join(imported_libs) if imported_libs else 'N/A'}
+                        Submitted By: {submitted_by} at {submission_time}
+                        Assemblyline Score: {max_score}, Errors: {error_count}, Services Used: {services}
+                        """
+
+            response = openai_llm.chat.completions.create(
+                model="gpt-4",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3,
+                max_tokens=5000,
+            )
+
+            return response.choices[0].message.content.strip()
+
+        except Exception as e:
+            return f"[summary generation failed: {e}]"
+
 
     async def process_alert(self, hit):
         alert_id = hit.get("_id")
         if not alert_id or self.tracker.alert_exists(alert_id):
-            self.log.info(f"Skipping duplicate or missing alert_id: {alert_id}")
+            log.info(f"Skipping duplicate or missing alert_id: {alert_id}")
             return
 
         hit = hit.copy()
@@ -319,10 +372,17 @@ class StrelkaProcessorThread(threading.Thread):
                     if result:
                         reports.append({"assemblyline_report": result})
                 except Exception as e:
-                    self.log.error(f"Failed to handle file {filename}: {e}")
+                    log.error(f"Failed to handle file {filename}: {e}")
                 finally:
                     if os.path.exists(debug_path):
                         os.unlink(debug_path)
+
+        # Generate LLM summary and build alert document
+        suumary = ""
+        try:
+            summary = self.summarize_alert_with_llm(hit, reports, artifacts)
+        except Exception as err:
+            log.error(f"OpenAI experience an error: {err}")
 
         alert_doc = {
             "alert_id": alert_id,
@@ -333,7 +393,7 @@ class StrelkaProcessorThread(threading.Thread):
                 "reports": reports,
                 "artifacts": artifacts,
                 "tags": [],
-                "notes": ""
+                "summary": summary
             }
         }
         self.tracker.save_alert(alert_doc)
@@ -376,7 +436,7 @@ class StrelkaProcessorThread(threading.Thread):
         sftp = paramiko.SFTPClient.from_transport(transport)
         try:
             sftp.get(remote_path, local_path)
-            self.log.info(f"SFTP downloaded {remote_path} to {local_path}")
+            log.info(f"SFTP downloaded {remote_path} to {local_path}")
         finally:
             sftp.close()
             transport.close()
